@@ -237,7 +237,7 @@ pub fn init(
     self.registerGlobalHotkey();
 
     // Check for updates in the background (non-blocking).
-    self.startUpdateCheck();
+    self.startUpdateCheck(false);
 }
 
 pub fn run(self: *App) !void {
@@ -1374,7 +1374,7 @@ pub fn performAction(
         },
 
         .check_for_updates => {
-            self.startUpdateCheck();
+            self.startUpdateCheck(true);
             return true;
         },
 
@@ -1742,8 +1742,16 @@ const UPDATE_CHECK_INTERVAL_SECS: i64 = 60 * 60; // 1 hour
 /// fetch if we checked within the last UPDATE_CHECK_INTERVAL_SECS.
 /// Manual `.check_for_updates` actions force-refresh by setting
 /// `force=true`.
-fn startUpdateCheck(self: *App) void {
-    if (!self.shouldRunUpdateCheck()) {
+fn startUpdateCheck(self: *App, force: bool) void {
+    if (!force) {
+        if (self.config.@"auto-update") |mode| {
+            if (mode == .off) {
+                log.debug("skipping update check (auto-update=off)", .{});
+                return;
+            }
+        }
+    }
+    if (!self.shouldRunUpdateCheck(force)) {
         log.debug("skipping update check (last run within {d}s)", .{UPDATE_CHECK_INTERVAL_SECS});
         return;
     }
@@ -1755,7 +1763,7 @@ fn startUpdateCheck(self: *App) void {
 /// Read the persisted "last checked at" timestamp; return true if
 /// it's missing/stale. Updates the file with the current timestamp on
 /// the way out so a successful return throttles the next call.
-fn shouldRunUpdateCheck(self: *App) bool {
+fn shouldRunUpdateCheck(self: *App, force: bool) bool {
     const alloc = self.core_app.alloc;
     const io = global.io();
     const dir = global.environ().getAlloc(alloc, "LOCALAPPDATA") catch return true;
@@ -1768,7 +1776,7 @@ fn shouldRunUpdateCheck(self: *App) bool {
         defer alloc.free(contents);
         const text = std.mem.trim(u8, contents, " \t\r\n");
         if (std.fmt.parseInt(i64, text, 10)) |last| {
-            if (now - last < UPDATE_CHECK_INTERVAL_SECS) return false;
+            if (!force and now - last < UPDATE_CHECK_INTERVAL_SECS) return false;
         } else |_| {}
     } else |_| {}
 

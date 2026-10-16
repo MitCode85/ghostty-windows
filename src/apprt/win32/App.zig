@@ -34,6 +34,10 @@ pub const must_draw_from_app_thread = false;
 /// core_app.tick() is called.
 const WM_APP_WAKEUP: u32 = w32.WM_APP + 1;
 
+/// The core holds the renderer lock during open_url, and ShellExecuteW pumps
+/// messages whose handlers take that lock, so the URL is opened later.
+const WM_APP_OPEN_URL: u32 = w32.WM_APP + 4;
+
 /// Timer ID for the quit-after-last-window-closed delay.
 const QUIT_TIMER_ID: usize = 1;
 
@@ -663,21 +667,17 @@ pub fn performAction(
         },
 
         .open_url => {
-            // Open a URL using ShellExecuteW — the native Windows way.
-            // internal_os.open() uses std.process.Child which can hit
-            // unreachable on Windows, so we use ShellExecuteW directly.
-            var wbuf: [2048]u16 = undefined;
-            const wlen = std.unicode.utf8ToUtf16Le(&wbuf, value.url) catch return true;
-            if (wlen < wbuf.len) {
-                wbuf[wlen] = 0;
-                _ = w32.ShellExecuteW(
-                    null,
-                    std.unicode.utf8ToUtf16LeStringLiteral("open"),
-                    @ptrCast(&wbuf),
-                    null,
-                    null,
-                    w32.SW_SHOW,
-                );
+            // Deferred via WM_APP_OPEN_URL; the handler owns the copy.
+            const hwnd = self.msg_hwnd orelse return true;
+            const alloc = self.core_app.alloc;
+            const owned = alloc.dupe(u8, value.url) catch {
+                log.warn("oom allocating url to open", .{});
+                return true;
+            };
+            const wparam: usize = @intFromPtr(owned.ptr);
+            const lparam: isize = @intCast(owned.len);
+            if (w32.PostMessageW(hwnd, WM_APP_OPEN_URL, wparam, lparam) == 0) {
+                alloc.free(owned);
             }
             return true;
         },
@@ -2431,6 +2431,24 @@ fn surfaceWndProc(
     }
 }
 
+/// Open a URL in the default handler. internal_os.open() uses
+/// std.process.Child which can hit unreachable on Windows, so we use
+/// ShellExecuteW directly.
+fn openUrlNow(url: []const u8) void {
+    var wbuf: [2048]u16 = undefined;
+    const wlen = std.unicode.utf8ToUtf16Le(&wbuf, url) catch return;
+    if (wlen >= wbuf.len) return;
+    wbuf[wlen] = 0;
+    _ = w32.ShellExecuteW(
+        null,
+        std.unicode.utf8ToUtf16LeStringLiteral("open"),
+        @ptrCast(&wbuf),
+        null,
+        null,
+        w32.SW_SHOW,
+    );
+}
+
 /// Window procedure for the message-only HWND (GhosttyMsg class).
 /// GWLP_USERDATA stores an *App pointer.
 fn msgWndProc(
@@ -2457,6 +2475,19 @@ fn msgWndProc(
             const ver = ptr[0..len];
             defer app.core_app.alloc.free(ver);
             app.showUpdateNotification(ver);
+        }
+        return 0;
+    }
+
+    if (msg == WM_APP_OPEN_URL) {
+        // wparam = heap pointer to the UTF-8 URL, lparam = length.
+        // We own the buffer and must free it after use.
+        if (wparam != 0 and lparam > 0) {
+            const ptr: [*]u8 = @ptrFromInt(wparam);
+            const len: usize = @intCast(lparam);
+            const url = ptr[0..len];
+            defer app.core_app.alloc.free(url);
+            openUrlNow(url);
         }
         return 0;
     }
